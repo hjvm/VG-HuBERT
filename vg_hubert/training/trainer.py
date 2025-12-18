@@ -6,13 +6,13 @@ from tqdm import tqdm
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
-from datasets import spokencoco_dataset, places_dataset
-from datasets.sampler import StatefulSampler
-from models import dual_encoder
+from ..datasets import spokencoco_dataset, places_dataset
+from ..datasets.sampler import StatefulSampler
+from ..model import dual_encoder
 from .utils import *
 from .trainer_utils import *
 from .bert_adam import BertAdam
-from models import vit_utils
+from ..model import vit_utils
 from apex.fp16_utils import *
 from apex import amp
 from logging import getLogger

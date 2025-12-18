@@ -1,0 +1,50 @@
+# VG-HuBERT Training Configuration
+
+# Dataset
+train_audio_dataset_json_file: "/path/to/SpokenCOCO/SpokenCOCO_train_unrolled_karpathy.json"
+val_audio_dataset_json_file: "/path/to/SpokenCOCO/SpokenCOCO_val_unrolled_karpathy.json"
+audio_feat_len: 8.0        # Max audio length in seconds (training)
+val_audio_feat_len: 10.0   # Max audio length in seconds (validation)
+normalize: false           # Whether to normalize audio input
+
+# Model Architecture
+encoder_layers: 13         # Number of HuBERT layers (layer_use + 1)
+layer_use: 12              # Target layer for features
+vit_arch: "vitsmall"       # Vision transformer: vitsmall, vitbase, vittiny
+vit_patch_size: 8          # ViT patch size
+common_embed_dim: 2048     # Common embedding space dimension
+xtrm_layers: 5             # Number of cross-modal transformer layers
+
+# Pre-trained Weights
+load_hubert_weights: "/path/to/hubert_base_ls960.pt"
+load_pretrained_vit: "/path/to/dino_vitsmall8_pretrain.pth"
+vit_checkpoint_key: "teacher"
+
+# Loss Weights
+fine_matching_weight: 1.0
+cls_coarse_matching_weight: 0.1
+feat_coarse_matching_weight: 0.1
+margin: 1.0
+
+# Training
+seed: 1
+exp_dir: "./checkpoints/spokencoco_run1"
+batch_size: 32
+val_batch_size: 32
+val_cross_batch_size: 256
+n_epochs: 30
+lr: 0.0001
+warmup_fraction: 0.1
+opt_level: "O1"            # Mixed precision: O0 (fp32), O1 (recommended), O2, O3
+
+# Hardware
+gpus: "0,1,2,3"            # GPU IDs (comma-separated)
+num_workers: 8
+
+# Logging
+n_print_steps: 100
+n_val_steps: 1000
+
+# Dataset Choice (uncomment one)
+dataset: "spokencoco"
+# dataset: "places"

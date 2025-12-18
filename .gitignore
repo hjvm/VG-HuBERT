@@ -10,3 +10,22 @@ test*
 *.log
 vg-hubert_3/
 *.tar
+
+# Original README and cleanup scripts (keep local only)
+README_ORIGINAL.md
+# Training artifacts
+checkpoints/
+logs/
+runs/
+wandb/
+*.ckpt
+*.pth.tar
+
+# Data directories (user-specific)
+data/
+datasets_cache/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
