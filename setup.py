@@ -68,11 +68,6 @@ setup(
     package_data={
         "vg_hubert": ["*.yaml", "*.json"],
     },
-    entry_points={
-        "console_scripts": [
-            "vg-hubert-segment=vg_hubert.cli:segment_cli",
-        ],
-    },
     license="BSD-3-Clause",
     keywords="speech audio segmentation syllables self-supervised hubert vg-hubert",
 )
