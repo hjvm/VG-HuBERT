@@ -45,7 +45,7 @@ class Segmenter:
              - "syllable": MinCut-based syllable segmentation (default)
              - "word": Attention-based word segmentation
         layer: Which HuBERT layer to use (default: 8 for syllables, 9 for words)
-        device: 'cuda' or 'cpu' (default: 'cuda' if available)
+        device: 'cuda', 'mps', or 'cpu' (default: 'cuda', auto-falls back to mps/cpu)
         sec_per_syllable: Target syllable duration for MinCut (default: 0.2)
         merge_threshold: Similarity threshold for merging segments (default: 0.3)
         attn_threshold: Attention threshold for word segmentation (default: 0.7)
@@ -101,11 +101,18 @@ class Segmenter:
         
         self.attn_threshold = attn_threshold
         
-        # Device setup
-        if device == "cuda" and not torch.cuda.is_available():
-            logger.warning("CUDA not available, using CPU")
-            device = "cpu"
-        self.device = device
+        # Device setup: try CUDA -> MPS -> CPU
+        if device == "cuda":
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                logger.info("CUDA not available, using MPS (Apple Silicon GPU)")
+                self.device = "mps"
+            else:
+                logger.warning("CUDA not available, using CPU")
+                self.device = "cpu"
+        else:
+            self.device = device
         
         # Auto-detect model path if not provided
         if model_ckpt is None:
