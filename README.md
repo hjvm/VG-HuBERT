@@ -40,7 +40,7 @@ import soundfile as sf
 segmenter = Segmenter(
     model_ckpt="YOUR_USERNAME/vg-hubert",  # HuggingFace Hub or local path
     mode="syllable",
-    device="cuda"  # or "cpu"
+    device="cuda"  # or "mps" or "cpu" (auto-detects best available)
 )
 
 outputs = segmenter("audio.wav")
@@ -58,7 +58,7 @@ frame_features = outputs['hidden_states']       # [num_frames, 768]
 
 - **mode**: `"syllable"` (MinCut + feature similarity) or `"word"` (CLS attention)
 - **layer**: HuBERT layer to use (default: 8 for syllables, 9 for words)
-- **device**: `"cuda"` or `"cpu"`
+- **device**: `"cuda"`, `"mps"`, or `"cpu"` (defaults to CUDA if available, falls back to MPS on Apple Silicon, then CPU)
 - **sec_per_syllable**: Target syllable duration for MinCut (default: 0.2)
 - **merge_threshold**: Similarity threshold for merging segments (default: 0.3)
 - **attn_threshold**: Attention threshold for word boundaries (default: 0.25)
@@ -156,6 +156,11 @@ See [configs/](configs/) for complete training examples.
 3. **HuggingFace Hub**: Automatic model downloading
 4. **Complete package**: Both training and inference (like Sylber)
 5. **PyPI distribution**: Easy installation via pip
+6. **Apple Silicon support**: Automatic MPS (Metal Performance Shaders) GPU acceleration
+
+## Implementation Details
+
+For inference, this package uses HuggingFace's `transformers.HubertModel` instead of the original fairseq implementation. This is possible because VG-HuBERT's audio encoder architecture is identical to the standard HuBERT model. The visual grounding training adds a vision encoder and cross-modal transformer layers, but these components are only used during training to learn better speech representations. At inference time, only the audio encoder weights are needed, which are fully compatible with the HuggingFace HuBERT architecture. This simplifies deployment and eliminates the fairseq dependency for inference.
 
 ## Citations
 
