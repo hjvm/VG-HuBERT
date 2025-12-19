@@ -1,14 +1,26 @@
-# apex==0.1    # Couldn't find apex==0.1 in my case, only 0.9.8-based ones
-fairseq==0.10.0
-# faiss==1.5.3, For me this didnt work. I installed it from GitHub facebook/faiss 
-matplotlib==3.5.1
-numpy==1.20.3
-Pillow==9.1.1
-scikit-learn==1.1.1
-scipy==1.6.3
-seaborn==0.11.1
-SoundFile==0.10.3.post1
-# torch==1.10.0
-# torchvision==0.11.0
-# This didn't work. I used: pip install torch==1.10.0+cu111 torchvision==0.11.0+cu111 torchaudio==0.10.0 -f https://download.pytorch.org/whl/torch_stable.html
-tqdm==4.60.0
+# VG-HuBERT Requirements
+# Core inference dependencies (minimal install)
+
+# Core
+torch>=2.0.0
+transformers>=4.20.0
+huggingface-hub>=0.10.0
+
+# Audio processing
+numpy>=1.20.0
+soundfile>=0.10.0
+scipy>=1.6.0
+
+# Optional (for audio resampling if needed)
+librosa>=0.9.0
+
+# Training-only dependencies (install with: pip install -e .[training])
+# These are NOT required for inference
+#
+# fairseq>=0.10.0      # Audio encoder training (has compatibility issues with Python 3.11+)
+# apex                 # Mixed precision training (install from: https://github.com/NVIDIA/apex)
+# Pillow>=9.0.0       # Image loading for visual grounding
+# matplotlib>=3.5.0   # Visualization
+# scikit-learn>=1.1.0 # Utilities
+# seaborn>=0.11.0     # Plotting
+# tqdm>=4.60.0        # Progress bars
