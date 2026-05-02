@@ -34,9 +34,3 @@ def __getattr__(name):
         from .utils import Margin_InfoNCE_loss
         return Margin_InfoNCE_loss
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
-
-    "vit_tiny",
-    "vit_small",
-    "vit_base",
-    "Margin_InfoNCE_loss",
-]

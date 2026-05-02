@@ -18,17 +18,7 @@ Original Repos:
 
 from .segmenter import Segmenter
 
-# Training modules available via subpackages
-# from vg_hubert.model import DualEncoder, AudioEncoder
-# from vg_hubert.training import Trainer
-# from vg_hubert.datasets import SpokenCOCODataset, PlacesAudioDataset
-
 __all__ = ["Segmenter"]
 
 __version__ = "1.0.0"
-__version__ = "1.0.0"
-__author__ = "Puyuan Peng, David Harwath (original); YOUR_NAME (fork maintainer)"
-
-__all__ = [
-    "Segmenter",  # Main user-facing class (Sylber-compatible)
-]
+__author__ = "Puyuan Peng, David Harwath"

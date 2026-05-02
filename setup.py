@@ -13,19 +13,19 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="vg-hubert",
-    version="1.0.0",
-    author="Puyuan Peng, David Harwath (original); YOUR_NAME (fork maintainer)",
-    author_email="YOUR_EMAIL",
-    description="VG-HuBERT: Simplified interface for speech segmentation (no PyTorch patching required)",
+    version="1.2.0",
+    author="Puyuan Peng, David Harwath",
+    author_email="harwath@utexas.edu",
+    description="VG-HuBERT: Simplified interface for speech segmentation with HuggingFace Hub integration",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/YOUR_USERNAME/VG-HuBERT",
+    url="https://github.com/human-ai-lab/VG-HuBERT",
     project_urls={
-        "Original Word Discovery": "https://github.com/jasonppy/word-discovery",
+        "Original Paper (Words)": "https://arxiv.org/abs/2203.15081",
+        "Original Paper (Syllables)": "https://www.isca-speech.org/archive/interspeech_2023/peng23_interspeech.html",
         "Original Syllable Discovery": "https://github.com/jasonppy/syllable-discovery",
-        "Fork Parent": "https://github.com/human-ai-lab/VG-HuBERT",
-        "Interface Inspiration (Sylber)": "https://github.com/Berkeley-Speech-Group/sylber",
-        "HuggingFace Model": "https://huggingface.co/YOUR_USERNAME/vg-hubert",
+        "HuggingFace Model": "https://huggingface.co/hjvm/VG-HuBERT",
+        "Bug Tracker": "https://github.com/human-ai-lab/VG-HuBERT/issues",
     },
     packages=find_packages(include=["vg_hubert", "vg_hubert.*"]),
     classifiers=[

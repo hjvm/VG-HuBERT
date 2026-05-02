@@ -6,13 +6,23 @@ __pycache__/
 *.png
 *.gif
 *.pdf
-test*
 *.log
-vg-hubert_3/
-*.tar
 
-# Original README and cleanup scripts (keep local only)
-README_ORIGINAL.md
+# Build artifacts (PyPI packaging)
+build/
+dist/
+*.egg-info/
+
+# Documentation notes (development only)
+*_GUIDE.md
+*_NOTES.md
+*_COMPLETE.md
+*_FIXES*.md
+*_OPTIMIZATION.md
+*_COMPARISON.md
+QUICK_*.md
+READY_*.md
+
 # Training artifacts
 checkpoints/
 logs/
@@ -25,7 +35,6 @@ wandb/
 data/
 datasets_cache/
 
-# Build artifacts
-build/
-dist/
-*.egg-info/
+# Test files (keep validation notebook only)
+test_*.py
+!vg_hubert/tests/

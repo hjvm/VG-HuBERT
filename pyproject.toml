@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vg-hubert"
+version = "1.2.0"
+description = "VG-HuBERT: Simplified interface for speech segmentation with HuggingFace Hub integration"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "BSD-3-Clause"}
+authors = [
+    {name = "Puyuan Peng", email = "harwath@utexas.edu"},
+    {name = "David Harwath", email = "harwath@utexas.edu"}
+]
+keywords = ["speech", "audio", "segmentation", "syllables", "self-supervised", "hubert", "vg-hubert"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.20.0",
+    "huggingface-hub>=0.10.0",
+    "numpy>=1.20.0",
+    "soundfile>=0.10.0",
+    "scipy>=1.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+    "isort>=5.10.0",
+    "flake8>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/human-ai-lab/VG-HuBERT"
+"Original Paper (Words)" = "https://arxiv.org/abs/2203.15081"
+"Original Paper (Syllables)" = "https://www.isca-speech.org/archive/interspeech_2023/peng23_interspeech.html"
+"HuggingFace Model" = "https://huggingface.co/hjvm/VG-HuBERT"
+"Bug Tracker" = "https://github.com/human-ai-lab/VG-HuBERT/issues"
+
+[tool.setuptools]
+packages = ["vg_hubert", "vg_hubert.model", "vg_hubert.training", "vg_hubert.datasets", "vg_hubert.tests"]
+
+[tool.setuptools.package-data]
+vg_hubert = ["*.yaml", "*.json"]
