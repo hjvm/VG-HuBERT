@@ -597,7 +597,28 @@ def test_feature_parity_word_layer9(word_ckpt_path, test_audio):
 
 # ---------------------------------------------------------------------------
 # Tier 3: Image-space embeddings (audio_cls_token_proj)
+#
+# Real speech only: three LibriSpeech train-clean-100 utterances from different speakers
+# (LIBRISPEECH_DIR, default ~/datasets/LibriSpeech/train-clean-100). Every span is a segment the
+# segmenter itself found in that utterance; none is invented.
 # ---------------------------------------------------------------------------
+
+_LIBRI = Path(os.environ.get("LIBRISPEECH_DIR",
+                             Path.home() / "datasets/LibriSpeech/train-clean-100"))
+LIBRI_UTTS = ["103/1241/103-1241-0025.flac",       # speaker 103
+              "1034/121119/1034-121119-0012.flac",  # speaker 1034
+              "1040/133433/1040-133433-0021.flac"]  # speaker 1040
+
+
+@pytest.fixture(scope="module", params=LIBRI_UTTS)
+def libri_wav(request):
+    import soundfile as sf
+    f = _LIBRI / request.param
+    if not f.is_file():
+        pytest.skip(f"LibriSpeech utterance not found: {f}")
+    wav, sr = sf.read(str(f), dtype="float32")
+    assert sr == 16000
+    return wav
 
 
 @pytest.fixture(scope="module")
@@ -606,20 +627,24 @@ def syl_seg(syllable_ckpt_path):
     return Segmenter(model_ckpt=str(syllable_ckpt_path.parent), device="cpu")
 
 
-SPANS = [(0.10, 0.30), (0.50, 0.70), (0.90, 0.92), (1.20, 1.60)]
+def _found(seg, wav):
+    """The segments the segmenter itself finds in this utterance, in seconds."""
+    segs = seg(wav=wav)["segments"]
+    assert len(segs) >= 4
+    return [tuple(map(float, sp)) for sp in segs]
 
 
 @_SKIP_CKPT
-@_SKIP_AUDIO
-def test_image_embedding_parity(syl_seg, syllable_ckpt_path, test_audio):
+def test_image_embedding_parity(syl_seg, syllable_ckpt_path, libri_wav):
     """embed_utterance == reference CLS at layer_use (11) through audio_cls_token_proj."""
     from vg_hubert.segmenter import _load_image_head, _unpack_checkpoint
 
-    got = syl_seg.embed_utterance(wav=test_audio.numpy())
+    got = syl_seg.embed_utterance(wav=libri_wav)
     checkpoint = torch.load(str(syllable_ckpt_path), map_location="cpu")
     state_dict, cls_key = _unpack_checkpoint(checkpoint)
     ref = _ReferenceAudioEncoder(_extract_raw(state_dict, cls_key), state_dict[cls_key])
-    cls = torch.from_numpy(ref.extract(test_audio, tgt_layer=syl_seg.cls_layer, keep_cls=True)[0])
+    cls = torch.from_numpy(ref.extract(torch.from_numpy(libri_wav), tgt_layer=syl_seg.cls_layer,
+                                       keep_cls=True)[0])
     with torch.no_grad():
         want = _load_image_head(state_dict)(cls).numpy()
     assert got.shape == (2048,)
@@ -627,83 +652,81 @@ def test_image_embedding_parity(syl_seg, syllable_ckpt_path, test_audio):
 
 
 @_SKIP_CKPT
-@_SKIP_AUDIO
-def test_whole_span_equals_utterance(syl_seg, test_audio):
-    """An extra CLS copy that may see every frame is the original CLS."""
-    wav = test_audio.numpy()
-    u = syl_seg.embed_utterance(wav=wav)
-    X = syl_seg.embed_spans([(0.0, len(wav) / 16000)] + SPANS, wav=wav)
-    assert X.shape == (1 + len(SPANS), 2048) and np.isfinite(X).all()
+def test_whole_utterance_span_equals_utterance(syl_seg, libri_wav):
+    """A CLS copy allowed to see every frame (the utterance's own extent) is the original CLS;
+    one restricted to a found segment is not."""
+    u = syl_seg.embed_utterance(wav=libri_wav)
+    found = _found(syl_seg, libri_wav)
+    X = syl_seg.embed_spans([(0.0, len(libri_wav) / 16000)] + found, wav=libri_wav)
+    assert X.shape == (1 + len(found), 2048) and np.isfinite(X).all()
     np.testing.assert_allclose(X[0], u, atol=1e-4)
     assert not np.allclose(X[1], u, atol=1e-2)
 
 
 @_SKIP_CKPT
-@_SKIP_AUDIO
-def test_spans_independent_in_single_pass(syl_seg, test_audio):
-    """All spans in one pass == each span on its own (the CLS copies never see each other)."""
-    wav = test_audio.numpy()
-    together = syl_seg.embed_spans(SPANS, wav=wav)
-    alone = np.concatenate([syl_seg.embed_spans([sp], wav=wav) for sp in SPANS])
-    np.testing.assert_allclose(together, alone, atol=1e-4)
-    for kw in (dict(restrict="last_k", k=2),):
-        np.testing.assert_allclose(syl_seg.embed_spans(SPANS, wav=wav, **kw),
-                                   np.concatenate([syl_seg.embed_spans([sp], wav=wav, **kw) for sp in SPANS]),
-                                   atol=1e-4)
+def test_spans_independent_in_single_pass(syl_seg, libri_wav):
+    """All found segments in one pass == each segment on its own (the copies never see each other)."""
+    found = _found(syl_seg, libri_wav)
+    for kw in (dict(), dict(restrict="last_k", k=2)):
+        together = syl_seg.embed_spans(found, wav=libri_wav, **kw)
+        alone = np.concatenate([syl_seg.embed_spans([sp], wav=libri_wav, **kw) for sp in found])
+        np.testing.assert_allclose(together, alone, atol=1e-4)
 
 
 @_SKIP_CKPT
-@_SKIP_AUDIO
-def test_extra_cls_tokens_leave_frames_unchanged(syl_seg, test_audio):
-    """Frames and the original CLS are computed exactly as without the span tokens."""
+def test_extra_cls_tokens_leave_frames_unchanged(syl_seg, libri_wav):
+    """With one CLS copy per found segment (frame indices from the segmenter), frames and the
+    original CLS are computed exactly as without the copies."""
     m = syl_seg.model
+    seg_frames = syl_seg(wav=libri_wav, in_second=False)["segments"]
+    audio = torch.from_numpy(libri_wav).unsqueeze(0)
     with torch.no_grad():
-        h = m.feature_projection(m.feature_extractor(test_audio.unsqueeze(0)).transpose(1, 2))
+        h = m.feature_projection(m.feature_extractor(audio).transpose(1, 2))
         T = h.size(1)
+        rows = torch.zeros(len(seg_frames), T, dtype=torch.bool)
+        for j, (l, r) in enumerate(seg_frames):
+            rows[j, int(l):int(r)] = True
         plain = m.encoder(h.clone(), output_hidden_states=True).hidden_states
-        rows = torch.zeros(3, T, dtype=torch.bool); rows[0, 5:15] = rows[1, 20:22] = rows[2, :] = True
         extra = m.encoder(h.clone(), output_hidden_states=True, span_attend=rows).hidden_states
     for a, b in zip(plain, extra):
         np.testing.assert_allclose(b[:, :T + 1].numpy(), a.numpy(), atol=1e-5)
 
 
 @_SKIP_CKPT
-@_SKIP_AUDIO
-def test_call_image_opt_in(syl_seg, test_audio):
+def test_call_image_opt_in(syl_seg, libri_wav):
     """image=False adds nothing; image=True keeps every acoustic key identical and adds the two
-    image keys; segment_image matches embed_spans on the same spans."""
-    wav = test_audio.numpy()
-    base = syl_seg(wav=wav)
-    plain = syl_seg(wav=wav, image=False)
+    image keys; segment_image matches embed_spans on the same found segments."""
+    base = syl_seg(wav=libri_wav)
+    plain = syl_seg(wav=libri_wav, image=False)
     assert set(base) == set(plain) and "utterance_image" not in base and "segment_image" not in base
-    full = syl_seg(wav=wav, image=True)
+    full = syl_seg(wav=libri_wav, image=True)
     for key in base:
         a, b = base[key], full[key]
-        assert (np.array_equal(np.asarray(a), np.asarray(b)) if not torch.is_tensor(a)
-                else torch.equal(a, b)), key
+        assert (torch.equal(a, b) if torch.is_tensor(a)
+                else np.array_equal(np.asarray(a), np.asarray(b))), key
     assert full["utterance_image"].shape == (2048,)
     assert full["segment_image"].shape == (len(base["segments"]), 2048)
-    np.testing.assert_allclose(full["utterance_image"], syl_seg.embed_utterance(wav=wav), atol=1e-5)
+    np.testing.assert_allclose(full["utterance_image"], syl_seg.embed_utterance(wav=libri_wav), atol=1e-5)
     np.testing.assert_allclose(full["segment_image"],
-                               syl_seg.embed_spans(base["segments"], wav=wav), atol=1e-4)
-    given = syl_seg(wav=wav, image=True, image_spans=SPANS)["segment_image"]
-    np.testing.assert_allclose(given, syl_seg.embed_spans(SPANS, wav=wav), atol=1e-4)
+                               syl_seg.embed_spans(base["segments"], wav=libri_wav), atol=1e-4)
+    sub = [tuple(sp) for sp in base["segments"][::2]]          # found segments, passed explicitly
+    np.testing.assert_allclose(syl_seg(wav=libri_wav, image=True, image_spans=sub)["segment_image"],
+                               syl_seg.embed_spans(sub, wav=libri_wav), atol=1e-4)
 
 
 @_SKIP_CKPT
-@_SKIP_AUDIO
-def test_word_checkpoint_warns_and_returns_none(word_ckpt_path, test_audio):
+def test_word_checkpoint_warns_and_returns_none(word_ckpt_path, libri_wav):
     """No image head: warn at load and on access, return None, keep the acoustic output."""
     from vg_hubert import Segmenter
 
     with pytest.warns(UserWarning, match="no audio-to-image head"):
         seg = Segmenter(model_ckpt=str(word_ckpt_path.parent), device="cpu", mode="word")
-    wav = test_audio.numpy()
+    found = [tuple(sp) for sp in seg(wav=libri_wav)["segments"]]
     with pytest.warns(UserWarning, match="no audio-to-image head"):
-        assert seg.embed_utterance(wav=wav) is None
+        assert seg.embed_utterance(wav=libri_wav) is None
     with pytest.warns(UserWarning, match="no audio-to-image head"):
-        assert seg.embed_spans(SPANS, wav=wav) is None
+        assert seg.embed_spans(found, wav=libri_wav) is None
     with pytest.warns(UserWarning, match="no audio-to-image head"):
-        out = seg(wav=wav, image=True)
+        out = seg(wav=libri_wav, image=True)
     assert out["utterance_image"] is None and out["segment_image"] is None
     assert len(out["segments"]) > 0 and out["hidden_states"].ndim == 2
