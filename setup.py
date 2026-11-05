@@ -13,7 +13,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="vg-hubert",
-    version="1.2.0",
+    version="1.3.0",
     author="Puyuan Peng, David Harwath",
     author_email="harwath@utexas.edu",
     description="VG-HuBERT: Simplified interface for speech segmentation with HuggingFace Hub integration",
