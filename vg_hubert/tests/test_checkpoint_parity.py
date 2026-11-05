@@ -288,7 +288,7 @@ class _ReferenceAudioEncoder:
     # Public API
     # ------------------------------------------------------------------
 
-    def extract(self, audio: torch.Tensor, tgt_layer: int) -> np.ndarray:
+    def extract(self, audio: torch.Tensor, tgt_layer: int, keep_cls: bool = False) -> np.ndarray:
         """
         Parameters
         ----------
@@ -341,6 +341,8 @@ class _ReferenceAudioEncoder:
             for i in range(tgt_layer + 1):
                 x = self._transformer_layer(x, i)
 
+        if keep_cls:
+            return x[0].numpy()  # [T_feat+1, 768], CLS at position 0
         # Strip CLS (position 0), return audio frames only
         return x[0, 1:].numpy()  # [T_feat, 768]
 
@@ -591,3 +593,54 @@ def test_feature_parity_word_layer9(word_ckpt_path, test_audio):
             f"Max abs diff: {np.abs(ref_features - hf_features).max():.2e}"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: Image-space embeddings (audio_cls_token_proj)
+# ---------------------------------------------------------------------------
+
+
+@_SKIP_CKPT
+@_SKIP_AUDIO
+def test_image_embedding_parity(syllable_ckpt_path, test_audio):
+    """embed_utterance == reference CLS at layer_use (11) through audio_cls_token_proj."""
+    from vg_hubert import Segmenter
+    from vg_hubert.segmenter import _load_image_head, _unpack_checkpoint
+
+    seg = Segmenter(model_ckpt=str(syllable_ckpt_path.parent), device="cpu")
+    got = seg._image_cls(test_audio.unsqueeze(0))[0].numpy()
+
+    checkpoint = torch.load(str(syllable_ckpt_path), map_location="cpu")
+    state_dict, cls_key = _unpack_checkpoint(checkpoint)
+    ref = _ReferenceAudioEncoder(_extract_raw(state_dict, cls_key), state_dict[cls_key])
+    cls = torch.from_numpy(ref.extract(test_audio, tgt_layer=seg.cls_layer, keep_cls=True)[0])
+    with torch.no_grad():
+        want = _load_image_head(state_dict)(cls).numpy()
+
+    assert got.shape == (2048,)
+    np.testing.assert_allclose(got, want, atol=1e-3, rtol=1e-4)
+
+
+@_SKIP_CKPT
+@_SKIP_AUDIO
+def test_whole_span_equals_utterance(syllable_ckpt_path, test_audio):
+    """A span covering every frame leaves the CLS unrestricted, so it equals embed_utterance."""
+    from vg_hubert import Segmenter
+
+    seg = Segmenter(model_ckpt=str(syllable_ckpt_path.parent), device="cpu")
+    wav = test_audio.numpy()
+    u = seg.embed_utterance(wav=wav)
+    spans = seg.embed_spans([(0.0, len(wav) / 16000), (0.5, 0.7)], wav=wav)
+    assert spans.shape == (2, 2048) and np.isfinite(spans).all()
+    np.testing.assert_allclose(spans[0], u, atol=1e-4)
+    assert not np.allclose(spans[1], u, atol=1e-2)
+
+
+@_SKIP_CKPT
+@_SKIP_AUDIO
+def test_word_checkpoint_has_no_image_head(word_ckpt_path, test_audio):
+    from vg_hubert import Segmenter
+
+    seg = Segmenter(model_ckpt=str(word_ckpt_path.parent), device="cpu", mode="word")
+    with pytest.raises(RuntimeError, match="audio-to-image head"):
+        seg.embed_utterance(wav=test_audio.numpy())

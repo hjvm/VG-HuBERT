@@ -120,6 +120,22 @@ def _build_hf_state_dict(state_dict: dict, cls_key: str) -> dict:
     return hf_state
 
 
+def _load_image_head(state_dict: dict) -> Optional[nn.Module]:
+    """
+    The audio-to-image projection (DualEncoder.audio_cls_token_proj: Linear -> GELU -> Linear,
+    768 -> 1536 -> 2048) from a dual_encoder checkpoint. It maps the CLS token into the space
+    shared with images. Only the syllable checkpoint has it; the word checkpoint is audio-only.
+    """
+    w0 = state_dict.get("audio_cls_token_proj.0.weight")
+    if w0 is None:
+        return None
+    w2 = state_dict["audio_cls_token_proj.2.weight"]
+    head = nn.Sequential(nn.Linear(w0.shape[1], w0.shape[0]), nn.GELU(), nn.Linear(w2.shape[1], w2.shape[0]))
+    head.load_state_dict({k[len("audio_cls_token_proj."):]: v for k, v in state_dict.items()
+                          if k.startswith("audio_cls_token_proj.")})
+    return head.eval()
+
+
 class _HubertEncoderWithCLS(nn.Module):
     """
     Wraps HubertEncoder to inject a learned CLS token between positional encoding
@@ -142,7 +158,15 @@ class _HubertEncoderWithCLS(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
+        cls_attend: Optional[torch.Tensor] = None,
+        cls_attend_layers: Optional[set] = None,
     ):
+        """
+        cls_attend: optional bool [batch, T] -- audio frames the CLS token may attend to. Only the
+            CLS query row is restricted; every frame still attends over the whole utterance.
+        cls_attend_layers: transformer layers (0-indexed) where the restriction applies
+            (default: all). Without cls_attend the forward is unchanged.
+        """
         from transformers.modeling_outputs import BaseModelOutput
 
         # Zero out padded positions before positional encoding (audio frames only).
@@ -171,16 +195,28 @@ class _HubertEncoderWithCLS(nn.Module):
         # Build full additive attention mask (handles T+1 CLS-augmented sequence).
         attention_mask_full = self.base._update_full_mask(attention_mask, hidden_states)
 
+        cls_mask = None
+        if cls_attend is not None:
+            n = hidden_states.size(1)                       # T + 1
+            neg = torch.finfo(hidden_states.dtype).min
+            cls_mask = (torch.zeros(batch_size, 1, n, n, dtype=hidden_states.dtype, device=hidden_states.device)
+                        if attention_mask_full is None else attention_mask_full.expand(batch_size, 1, n, n).clone())
+            allowed = torch.cat([torch.ones(batch_size, 1, dtype=torch.bool, device=cls_attend.device),
+                                 cls_attend.bool()], dim=1).to(hidden_states.device)
+            cls_mask[:, 0, 0, :] = cls_mask[:, 0, 0, :].masked_fill(~allowed, neg)
+
         # Run transformer layers.
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
 
-        for layer in self.base.layers:
+        for i, layer in enumerate(self.base.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
             layer_outputs = layer(
                 hidden_states,
-                attention_mask=attention_mask_full,
+                attention_mask=(cls_mask if cls_mask is not None and
+                                (cls_attend_layers is None or i in cls_attend_layers)
+                                else attention_mask_full),
                 output_attentions=output_attentions,
             )
             hidden_states = layer_outputs[0]
@@ -312,6 +348,7 @@ class Segmenter:
             model_ckpt = "hjvm/VG-HuBERT" # Will try to download from Hub
         
         # Load model
+        self.image_head = None
         self._load_model(model_ckpt)
     
     def _load_model(self, model_ckpt: str):
@@ -361,6 +398,8 @@ class Segmenter:
 
             # Map all audio_encoder keys to HuggingFace HuBERT equivalents
             audio_encoder_state = _build_hf_state_dict(state_dict, cls_key)
+            self.image_head = _load_image_head(state_dict)
+            self.cls_layer = getattr(args, 'layer_use', 11)   # layer whose CLS was trained against images
 
             missing_keys, unexpected_keys = self.model.load_state_dict(audio_encoder_state, strict=False)
             logger.info(
@@ -411,6 +450,8 @@ class Segmenter:
                 cls_token = state_dict.get(cls_key, None)
 
                 audio_encoder_state = _build_hf_state_dict(state_dict, cls_key)
+                self.image_head = _load_image_head(state_dict)
+                self.cls_layer = getattr(args, 'layer_use', 11)   # layer whose CLS was trained against images
                 missing_keys, unexpected_keys = self.model.load_state_dict(audio_encoder_state, strict=False)
                 logger.info(
                     f"Loaded {len(audio_encoder_state)} VG-HuBERT weights from Hub "
@@ -519,6 +560,88 @@ class Segmenter:
         
         return result
     
+    def _load_audio(self, wav_file=None, wav=None) -> torch.Tensor:
+        if wav_file is not None:
+            audio, sr = sf.read(wav_file, dtype='float32')
+        elif wav is not None:
+            audio, sr = np.asarray(wav, dtype=np.float32), 16000
+        else:
+            raise ValueError("Must provide either wav_file or wav")
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if sr != 16000:
+            import librosa
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+        return torch.from_numpy(audio).float().unsqueeze(0).to(self.device)
+
+    def _image_cls(self, audio_tensor, cls_attend=None, cls_attend_layers=None) -> torch.Tensor:
+        """Image-space CLS: CLS at layer `cls_layer` through audio_cls_token_proj. [batch, 2048]."""
+        if self.image_head is None or not self.has_cls_token:
+            raise RuntimeError(
+                "No audio-to-image head: image-space embeddings need the syllable checkpoint "
+                "(vg-hubert-syllable.pth, mode='syllable'); the word checkpoint is audio-only.")
+        m = self.model
+        with torch.no_grad():
+            h = m.feature_projection(m.feature_extractor(audio_tensor).transpose(1, 2))
+            if cls_attend is not None and h.size(0) != cls_attend.size(0):
+                h = h.expand(cls_attend.size(0), -1, -1).clone()
+            out = m.encoder(h, output_hidden_states=True, return_dict=True,
+                            cls_attend=cls_attend, cls_attend_layers=cls_attend_layers)
+            # hidden_states[layer+1] = output of transformer layer `layer`; position 0 = CLS
+            return self.image_head.to(h.device)(out.hidden_states[self.cls_layer + 1][:, 0])
+
+    def embed_utterance(self, wav_file: Optional[str] = None, wav: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        Image-space embedding of a whole utterance: the CLS token through the audio-to-image
+        projection, as in training (Peng & Harwath). Returns a [2048] array, unnormalised;
+        L2-normalise for cosine.
+        """
+        return self._image_cls(self._load_audio(wav_file, wav))[0].cpu().numpy()
+
+    def embed_spans(
+        self,
+        spans: List[Tuple[float, float]],
+        wav_file: Optional[str] = None,
+        wav: Optional[np.ndarray] = None,
+        restrict: str = "all",
+        k: int = 1,
+        batch_size: int = 16,
+    ) -> np.ndarray:
+        """
+        One image-space embedding per (start_s, end_s) span of an utterance.
+
+        The whole utterance is encoded, so every frame keeps its full context; only the CLS
+        token's attention is restricted to the span's frames (plus itself), and its output goes
+        through the same audio-to-image projection as embed_utterance(). A frame belongs to a
+        span when its centre (20 ms stride, 25 ms receptive field) falls inside it; a span
+        shorter than one frame takes the frame nearest its midpoint.
+
+        restrict: "all" restricts the CLS at every layer up to cls_layer; "last_k" only at the
+            last k of them (earlier layers see the whole utterance).
+        Returns [n_spans, 2048], unnormalised.
+        """
+        audio = self._load_audio(wav_file, wav)
+        with torch.no_grad():
+            T = self.model.feature_extractor(audio).shape[-1]
+        centre = (np.arange(T) * 320 + 200) / 16000.0
+        rows = []
+        for s, e in spans:
+            a = (centre >= s) & (centre < e)
+            if not a.any():
+                a[int(np.clip(np.argmin(np.abs(centre - (s + e) / 2)), 0, T - 1))] = True
+            rows.append(a)
+        if restrict == "all":
+            layers = None if self.cls_layer + 1 >= len(self.model.encoder.base.layers) else set(range(self.cls_layer + 1))
+        elif restrict == "last_k":
+            layers = set(range(max(0, self.cls_layer + 1 - k), self.cls_layer + 1))
+        else:
+            raise ValueError(f"restrict must be 'all' or 'last_k', got {restrict}")
+        out = []
+        for b in range(0, len(rows), batch_size):
+            att = torch.from_numpy(np.stack(rows[b:b + batch_size])).to(self.device)
+            out.append(self._image_cls(audio, cls_attend=att, cls_attend_layers=layers).cpu().numpy())
+        return np.concatenate(out) if out else np.zeros((0, 2048), np.float32)
+
     def _segment_featssm(
         self,
         features: np.ndarray,
