@@ -147,15 +147,26 @@ segmenter can also place audio in the space shared with images.
 from vg_hubert import Segmenter
 seg = Segmenter()                                    # syllable checkpoint
 
-u = seg.embed_utterance("audio.wav")                 # [2048]: CLS (layer 11) -> image space
+out = seg("audio.wav", image=True)                   # acoustic keys exactly as before, plus:
+out["utterance_image"]                               # [2048]: CLS (layer 11) -> image space
+out["segment_image"]                                 # [n_segments, 2048]: one per found segment
+
+u = seg.embed_utterance("audio.wav")                 # same as out["utterance_image"]
 spans = [(0.42, 0.61), (0.61, 0.80)]                 # (start_s, end_s)
 X = seg.embed_spans(spans, wav_file="audio.wav")     # [n_spans, 2048]
 X_last = seg.embed_spans(spans, wav_file="audio.wav", restrict="last_k", k=2)
+out = seg("audio.wav", image=True, image_spans=spans)  # segment_image for given spans
 ```
 
-`embed_spans` encodes the whole utterance once per batch of spans, so every frame keeps its full
-context, and restricts only the CLS token's attention to the span's frames (plus itself). The CLS
-output at the training layer then goes through the same projection as `embed_utterance`. A frame
+`image=False` (the default) returns exactly the same dictionary as before; `image=True` only adds
+`utterance_image` and `segment_image` and leaves every acoustic key identical. The utterance vector
+comes from the same forward pass as the acoustic features; the segment vectors need one more pass.
+
+Span vectors take a single forward pass over the whole utterance, so every frame keeps its full
+context. Each span gets its own copy of the CLS token, appended after the frames, whose attention is
+restricted to the span's frames (plus itself); the frames and the original CLS cannot see these
+copies, so they are computed exactly as without them. Each copy's output at the training layer goes
+through the same projection as `embed_utterance`. A frame
 belongs to a span when its centre (20 ms stride, 25 ms receptive field) falls inside it.
 `restrict="all"` (default) applies the restriction at every layer; `restrict="last_k"` only at the
 last `k` layers, so earlier layers' CLS sees the whole utterance. A span covering the whole
@@ -165,7 +176,10 @@ Caveat: the model was trained only with utterance-level CLS-to-image matching (n
 segment-level image loss), so a span vector is a readout of that CLS under restricted attention, not
 an embedding the model was trained to produce.
 
-The word checkpoint is audio-only and raises an error here.
+The word checkpoint (`mode="word"`) is audio-only. Loading it emits a warning that image-space
+vectors are unavailable, and each request for them warns again and returns `None`
+(`embed_utterance`, `embed_spans`, and `utterance_image` / `segment_image` with `image=True`); the
+acoustic output is unaffected.
 
 ### What works where
 
@@ -174,8 +188,8 @@ The word checkpoint is audio-only and raises an error here.
 | Frame features, any layer | ✅ | ✅ | ❌ |
 | Syllable segmentation (MinCut) | ✅ | ❌ | ❌ |
 | Word segmentation (CLS attention) | ✅ | ✅ attention weights only | ❌ |
-| Utterance image-space vector | ✅ `embed_utterance` (syllable checkpoint) | ✅ `DualEncoder.forward_audio` | ❌ |
-| Span image-space vectors | ✅ `embed_spans` (syllable checkpoint) | ❌ (`extract_features` does not pass `self_attn_mask`) | ❌ |
+| Utterance image-space vector | ✅ `seg(..., image=True)`, `embed_utterance` (syllable checkpoint) | ✅ `DualEncoder.forward_audio` | ❌ |
+| Span image-space vectors | ✅ `seg(..., image=True)`, `embed_spans` (syllable checkpoint) | ❌ (`extract_features` does not pass `self_attn_mask`) | ❌ |
 | Image encoder (ViT) | ❌ | ✅ | ❌ |
 
 The Hub repo hosts the original `.pth` checkpoints and `args.pkl`, not a `config.json`/safetensors
@@ -301,7 +315,7 @@ See [configs/](configs/) for complete training examples.
 5. **PyPI distribution**: Easy installation via pip
 6. **Apple Silicon support**: Automatic MPS (Metal Performance Shaders) GPU acceleration
 7. **Optimized MinCut**: **~20-50x faster** syllable segmentation using efficient algorithm from [SyllableLM](https://github.com/AlanBaade/SyllableLM) (Baade et al., 2024) with no quality degradation
-8. **Image-space embeddings**: the syllable checkpoint's audio-to-image head is loaded, exposing `embed_utterance` and `embed_spans`
+8. **Image-space embeddings**: the syllable checkpoint's audio-to-image head is loaded, exposing `seg(..., image=True)`, `embed_utterance` and `embed_spans`
 
 ## Implementation Details
 
