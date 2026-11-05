@@ -288,7 +288,7 @@ class _ReferenceAudioEncoder:
     # Public API
     # ------------------------------------------------------------------
 
-    def extract(self, audio: torch.Tensor, tgt_layer: int) -> np.ndarray:
+    def extract(self, audio: torch.Tensor, tgt_layer: int, keep_cls: bool = False) -> np.ndarray:
         """
         Parameters
         ----------
@@ -341,6 +341,8 @@ class _ReferenceAudioEncoder:
             for i in range(tgt_layer + 1):
                 x = self._transformer_layer(x, i)
 
+        if keep_cls:
+            return x[0].numpy()  # [T_feat+1, 768], CLS at position 0
         # Strip CLS (position 0), return audio frames only
         return x[0, 1:].numpy()  # [T_feat, 768]
 
@@ -591,3 +593,193 @@ def test_feature_parity_word_layer9(word_ckpt_path, test_audio):
             f"Max abs diff: {np.abs(ref_features - hf_features).max():.2e}"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: Image-space embeddings (audio_cls_token_proj)
+#
+# Real speech only: three LibriSpeech train-clean-100 utterances from different speakers
+# (LIBRISPEECH_DIR, default ~/datasets/LibriSpeech/train-clean-100). Every span is a segment the
+# segmenter itself found in that utterance; none is invented.
+# ---------------------------------------------------------------------------
+
+_LIBRI = Path(os.environ.get("LIBRISPEECH_DIR",
+                             Path.home() / "datasets/LibriSpeech/train-clean-100"))
+LIBRI_UTTS = ["103/1241/103-1241-0025.flac",       # speaker 103
+              "1034/121119/1034-121119-0012.flac",  # speaker 1034
+              "1040/133433/1040-133433-0021.flac"]  # speaker 1040
+
+
+@pytest.fixture(scope="module", params=LIBRI_UTTS)
+def libri_wav(request):
+    import soundfile as sf
+    f = _LIBRI / request.param
+    if not f.is_file():
+        pytest.skip(f"LibriSpeech utterance not found: {f}")
+    wav, sr = sf.read(str(f), dtype="float32")
+    assert sr == 16000
+    return wav
+
+
+@pytest.fixture(scope="module")
+def syl_seg(syllable_ckpt_path):
+    from vg_hubert import Segmenter
+    return Segmenter(model_ckpt=str(syllable_ckpt_path.parent), device="cpu")
+
+
+def _found(seg, wav):
+    """The segments the segmenter itself finds in this utterance, in seconds."""
+    segs = seg(wav=wav)["segments"]
+    assert len(segs) >= 4
+    return [tuple(map(float, sp)) for sp in segs]
+
+
+@_SKIP_CKPT
+def test_image_embedding_parity(syl_seg, syllable_ckpt_path, libri_wav):
+    """embed_utterance == reference CLS at layer_use (11) through audio_cls_token_proj."""
+    from vg_hubert.segmenter import _load_image_head, _unpack_checkpoint
+
+    got = syl_seg.embed_utterance(wav=libri_wav)
+    checkpoint = torch.load(str(syllable_ckpt_path), map_location="cpu")
+    state_dict, cls_key = _unpack_checkpoint(checkpoint)
+    ref = _ReferenceAudioEncoder(_extract_raw(state_dict, cls_key), state_dict[cls_key])
+    cls = torch.from_numpy(ref.extract(torch.from_numpy(libri_wav), tgt_layer=syl_seg.cls_layer,
+                                       keep_cls=True)[0])
+    with torch.no_grad():
+        want = _load_image_head(state_dict)(cls).numpy()
+    assert got.shape == (2048,)
+    np.testing.assert_allclose(got, want, atol=1e-3, rtol=1e-4)
+
+
+@_SKIP_CKPT
+def test_whole_utterance_span_equals_utterance(syl_seg, libri_wav):
+    """A CLS copy allowed to see every frame (the utterance's own extent) is the original CLS;
+    one restricted to a found segment is not."""
+    u = syl_seg.embed_utterance(wav=libri_wav)
+    found = _found(syl_seg, libri_wav)
+    X = syl_seg.embed_spans([(0.0, len(libri_wav) / 16000)] + found, wav=libri_wav)
+    assert X.shape == (1 + len(found), 2048) and np.isfinite(X).all()
+    np.testing.assert_allclose(X[0], u, atol=1e-4)
+    assert not np.allclose(X[1], u, atol=1e-2)
+
+
+@_SKIP_CKPT
+def test_spans_independent_in_single_pass(syl_seg, libri_wav):
+    """All found segments in one pass == each segment on its own (the copies never see each other)."""
+    found = _found(syl_seg, libri_wav)
+    for kw in (dict(), dict(restrict="last_k", k=2)):
+        together = syl_seg.embed_spans(found, wav=libri_wav, **kw)
+        alone = np.concatenate([syl_seg.embed_spans([sp], wav=libri_wav, **kw) for sp in found])
+        np.testing.assert_allclose(together, alone, atol=1e-4)
+
+
+@_SKIP_CKPT
+def test_extra_cls_tokens_leave_frames_unchanged(syl_seg, libri_wav):
+    """With one CLS copy per found segment (frame indices from the segmenter), frames and the
+    original CLS are computed exactly as without the copies."""
+    m = syl_seg.model
+    seg_frames = syl_seg(wav=libri_wav, in_second=False)["segments"]
+    audio = torch.from_numpy(libri_wav).unsqueeze(0)
+    with torch.no_grad():
+        h = m.feature_projection(m.feature_extractor(audio).transpose(1, 2))
+        T = h.size(1)
+        rows = torch.zeros(len(seg_frames), T, dtype=torch.bool)
+        for j, (l, r) in enumerate(seg_frames):
+            rows[j, int(l):int(r)] = True
+        plain = m.encoder(h.clone(), output_hidden_states=True).hidden_states
+        extra = m.encoder(h.clone(), output_hidden_states=True, span_attend=rows).hidden_states
+    for a, b in zip(plain, extra):
+        np.testing.assert_allclose(b[:, :T + 1].numpy(), a.numpy(), atol=1e-5)
+
+
+@_SKIP_CKPT
+def test_call_image_opt_in(syl_seg, libri_wav):
+    """image=False adds nothing; image=True keeps every acoustic key identical and adds the two
+    image keys; segment_image matches embed_spans on the same found segments."""
+    base = syl_seg(wav=libri_wav)
+    plain = syl_seg(wav=libri_wav, image=False)
+    assert set(base) == set(plain) and "utterance_image" not in base and "segment_image" not in base
+    full = syl_seg(wav=libri_wav, image=True)
+    for key in base:
+        a, b = base[key], full[key]
+        assert (torch.equal(a, b) if torch.is_tensor(a)
+                else np.array_equal(np.asarray(a), np.asarray(b))), key
+    assert full["utterance_image"].shape == (2048,)
+    assert full["segment_image"].shape == (len(base["segments"]), 2048)
+    np.testing.assert_allclose(full["utterance_image"], syl_seg.embed_utterance(wav=libri_wav), atol=1e-5)
+    np.testing.assert_allclose(full["segment_image"],
+                               syl_seg.embed_spans(base["segments"], wav=libri_wav), atol=1e-4)
+    sub = [tuple(sp) for sp in base["segments"][::2]]          # found segments, passed explicitly
+    np.testing.assert_allclose(syl_seg(wav=libri_wav, image=True, image_spans=sub)["segment_image"],
+                               syl_seg.embed_spans(sub, wav=libri_wav), atol=1e-4)
+
+
+@_SKIP_CKPT
+def test_word_checkpoint_warns_and_returns_none(word_ckpt_path, libri_wav):
+    """No image head: warn at load and on access, return None, keep the acoustic output."""
+    from vg_hubert import Segmenter
+
+    with pytest.warns(UserWarning, match="no audio-to-image head"):
+        seg = Segmenter(model_ckpt=str(word_ckpt_path.parent), device="cpu", mode="word")
+    found = [tuple(sp) for sp in seg(wav=libri_wav)["segments"]]
+    with pytest.warns(UserWarning, match="no audio-to-image head"):
+        assert seg.embed_utterance(wav=libri_wav) is None
+    with pytest.warns(UserWarning, match="no audio-to-image head"):
+        assert seg.embed_spans(found, wav=libri_wav) is None
+    with pytest.warns(UserWarning, match="no audio-to-image head"):
+        out = seg(wav=libri_wav, image=True)
+    assert out["utterance_image"] is None and out["segment_image"] is None
+    assert len(out["segments"]) > 0 and out["hidden_states"].ndim == 2
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: MPS == CPU (Apple Silicon only), on real LibriSpeech
+#
+# torch 2.8's MPS scaled_dot_product_attention is wrong for non-contiguous q/k/v on sequences of
+# <= 8 tokens; the segmenter therefore uses eager attention on MPS. Short inputs are exactly the
+# segmenter's own found segments cropped alone, so those are checked as well as whole utterances.
+# ---------------------------------------------------------------------------
+
+_SKIP_MPS = pytest.mark.skipif(not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
+                               reason="MPS not available")
+
+
+@pytest.fixture(scope="module")
+def mps_seg(syllable_ckpt_path):
+    from vg_hubert import Segmenter
+    return Segmenter(model_ckpt=str(syllable_ckpt_path.parent), device="mps")
+
+
+def _rel(a, b):
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    return float(np.abs(a - b).max() / (np.abs(a).max() + 1e-12))
+
+
+@_SKIP_MPS
+@_SKIP_CKPT
+def test_mps_matches_cpu(syl_seg, mps_seg, libri_wav):
+    cpu_out, mps_out = syl_seg(wav=libri_wav, image=True), mps_seg(wav=libri_wav, image=True)
+    assert [list(map(float, s)) for s in cpu_out["segments"]] == [list(map(float, s)) for s in mps_out["segments"]]
+    assert _rel(cpu_out["hidden_states"], mps_out["hidden_states"]) < 1e-3
+    assert _rel(cpu_out["utterance_image"], mps_out["utterance_image"]) < 1e-3
+    assert _rel(cpu_out["segment_image"], mps_out["segment_image"]) < 1e-3
+
+    found = [tuple(map(float, s)) for s in cpu_out["segments"]]
+    for kw in (dict(), dict(restrict="last_k", k=1)):
+        assert _rel(syl_seg.embed_spans(found, wav=libri_wav, **kw),
+                    mps_seg.embed_spans(found, wav=libri_wav, **kw)) < 1e-3
+
+    with torch.no_grad():
+        hc = syl_seg.model(input_values=torch.from_numpy(libri_wav)[None], output_hidden_states=True).hidden_states
+        hm = mps_seg.model(input_values=torch.from_numpy(libri_wav)[None].to("mps"), output_hidden_states=True).hidden_states
+    for L, (a, b) in enumerate(zip(hc, hm)):
+        assert _rel(a.numpy(), b.cpu().numpy()) < 1e-3, f"hidden_states[{L}]"
+
+    short = 0
+    for s, e in found:                                   # each found segment cropped alone
+        w = libri_wav[int(s * 16000):int(e * 16000)]
+        a, b = syl_seg(wav=w, image=True), mps_seg(wav=w, image=True)
+        short += a["hidden_states"].shape[0] <= 7
+        assert _rel(a["hidden_states"], b["hidden_states"]) < 1e-3, f"crop {e - s:.3f}s"
+        assert _rel(a["utterance_image"], b["utterance_image"]) < 1e-3, f"crop {e - s:.3f}s"
+    print(f"{len(found)} crops, {short} of <= 7 frames")

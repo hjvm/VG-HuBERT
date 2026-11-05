@@ -5,6 +5,30 @@ All notable changes to VG-HuBERT will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-05
+
+### Added
+- Image-space embeddings from the syllable checkpoint's audio-to-image head (`audio_cls_token_proj`,
+  768 → 1536 → 2048), which the HuggingFace loader now also loads (no new Hub files needed)
+  - `Segmenter.embed_utterance(...)`: utterance CLS at layer 11 through the image head, as in training
+  - `Segmenter.embed_spans(spans, ..., restrict="all" | "last_k", k=1)`: one image-space vector per
+    (start_s, end_s) span; the whole utterance is encoded and only the CLS attention is restricted to the span
+  - `Segmenter(...)(wav, image=True)`: opt-in `utterance_image` and `segment_image` keys alongside the
+    unchanged acoustic output; span vectors come from one extra pass with one CLS copy per span that the
+    frames cannot attend to, so frame features are unchanged
+- `test_mps_matches_cpu` and image-embedding parity tests, on real LibriSpeech utterances with
+  segmenter-found spans
+
+### Changed
+- The word checkpoint (no image head) now warns at load and on each image request, and returns `None`
+  for image outputs instead of raising
+
+### Fixed
+- Wrong outputs on Apple MPS for short inputs (<= 7 frames, ~0.16 s): torch 2.8's MPS
+  scaled_dot_product_attention is incorrect for non-contiguous q/k/v at <= 8 tokens. The segmenter now uses
+  eager attention on MPS (`Segmenter._attn_impl`); CPU and CUDA keep SDPA
+- `vg_hubert.__version__` was stale (1.0.0); now matches the package version
+
 ## [1.2.0] - 2026-05-02
 
 ### Fixed

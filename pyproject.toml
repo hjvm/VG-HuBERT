@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vg-hubert"
-version = "1.2.0"
+version = "1.3.0"
 description = "VG-HuBERT: Simplified interface for speech segmentation with HuggingFace Hub integration"
 readme = "README.md"
 requires-python = ">=3.8"

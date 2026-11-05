@@ -23,10 +23,15 @@ import soundfile as sf
 from typing import Dict, Union, Optional, List, Tuple
 from pathlib import Path
 import logging
+import warnings
 import os
 import pickle
 
 logger = logging.getLogger(__name__)
+
+_NO_IMAGE_HEAD = (
+    "This checkpoint has no audio-to-image head, so image-space vectors are unavailable "
+    "(they will be None). Use mode='syllable' (vg-hubert-syllable.pth) for them.")
 
 
 def _remap_vghubert_keys(key: str) -> Optional[str]:
@@ -120,6 +125,22 @@ def _build_hf_state_dict(state_dict: dict, cls_key: str) -> dict:
     return hf_state
 
 
+def _load_image_head(state_dict: dict) -> Optional[nn.Module]:
+    """
+    The audio-to-image projection (DualEncoder.audio_cls_token_proj: Linear -> GELU -> Linear,
+    768 -> 1536 -> 2048) from a dual_encoder checkpoint. It maps the CLS token into the space
+    shared with images. Only the syllable checkpoint has it; the word checkpoint is audio-only.
+    """
+    w0 = state_dict.get("audio_cls_token_proj.0.weight")
+    if w0 is None:
+        return None
+    w2 = state_dict["audio_cls_token_proj.2.weight"]
+    head = nn.Sequential(nn.Linear(w0.shape[1], w0.shape[0]), nn.GELU(), nn.Linear(w2.shape[1], w2.shape[0]))
+    head.load_state_dict({k[len("audio_cls_token_proj."):]: v for k, v in state_dict.items()
+                          if k.startswith("audio_cls_token_proj.")})
+    return head.eval()
+
+
 class _HubertEncoderWithCLS(nn.Module):
     """
     Wraps HubertEncoder to inject a learned CLS token between positional encoding
@@ -142,7 +163,18 @@ class _HubertEncoderWithCLS(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
+        span_attend: Optional[torch.Tensor] = None,
+        span_attend_layers: Optional[set] = None,
     ):
+        """
+        span_attend: optional bool [S, T] (batch of 1 only). Appends S extra copies of the CLS
+            token after the frames, one per span. Extra token j attends to itself and the frames
+            where span_attend[j] is True; nothing else attends to the extra tokens, so the
+            original CLS and every frame are computed exactly as without them.
+        span_attend_layers: layers (0-indexed) where the span restriction applies; elsewhere an
+            extra token attends to itself and all frames (default: every layer).
+        Without span_attend the forward is unchanged.
+        """
         from transformers.modeling_outputs import BaseModelOutput
 
         # Zero out padded positions before positional encoding (audio frames only).
@@ -171,16 +203,33 @@ class _HubertEncoderWithCLS(nn.Module):
         # Build full additive attention mask (handles T+1 CLS-augmented sequence).
         attention_mask_full = self.base._update_full_mask(attention_mask, hidden_states)
 
+        span_mask = full_mask = None
+        if span_attend is not None:
+            assert batch_size == 1 and attention_mask is None, "span_attend: one unpadded utterance"
+            T, S = hidden_states.size(1) - 1, span_attend.size(0)
+            hidden_states = torch.cat([hidden_states, cls.expand(1, S, cls.size(-1))], dim=1)
+            n, neg, dev = 1 + T + S, torch.finfo(hidden_states.dtype).min, hidden_states.device
+            ok = torch.zeros(n, n, dtype=torch.bool, device=dev)
+            ok[:T + 1, :T + 1] = True                       # CLS + frames: exactly as before
+            ok[T + 1:, T + 1:] = torch.eye(S, dtype=torch.bool, device=dev)   # extra token: itself
+            full_ok, span_ok = ok.clone(), ok
+            full_ok[T + 1:, 1:T + 1] = True                 # unrestricted layer: all frames
+            span_ok[T + 1:, 1:T + 1] = span_attend.bool().to(dev)
+            to_mask = lambda m: torch.zeros(1, 1, n, n, dtype=hidden_states.dtype, device=dev).masked_fill(~m, neg)
+            span_mask, full_mask = to_mask(span_ok), to_mask(full_ok)
+
         # Run transformer layers.
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
 
-        for layer in self.base.layers:
+        for i, layer in enumerate(self.base.layers):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
             layer_outputs = layer(
                 hidden_states,
-                attention_mask=attention_mask_full,
+                attention_mask=(attention_mask_full if span_mask is None else
+                                span_mask if span_attend_layers is None or i in span_attend_layers
+                                else full_mask),
                 output_attentions=output_attentions,
             )
             hidden_states = layer_outputs[0]
@@ -312,8 +361,20 @@ class Segmenter:
             model_ckpt = "hjvm/VG-HuBERT" # Will try to download from Hub
         
         # Load model
+        self.image_head = None
         self._load_model(model_ckpt)
+        if self.image_head is None:
+            warnings.warn(_NO_IMAGE_HEAD, stacklevel=2)
     
+    def _attn_impl(self) -> str:
+        """Eager attention for CLS segmentation (needs attention weights) and on MPS; SDPA otherwise.
+
+        torch 2.8's MPS scaled_dot_product_attention returns wrong results when q/k/v are
+        non-contiguous (as transformers passes them) and the sequence is <= 8 tokens, i.e. audio of
+        <= 7 frames (~0.16 s) plus the CLS token. Eager attention is correct on MPS at every length.
+        """
+        return 'eager' if self.segmentation_method == 'CLS' or self.device == 'mps' else 'sdpa'
+
     def _load_model(self, model_ckpt: str):
         """Load VG-HuBERT model."""
         from transformers import HubertModel
@@ -347,7 +408,7 @@ class Segmenter:
             # Initialize model using transformers HuBERT (avoids fairseq dependency)
             # Use eager attention for CLS segmentation (needs attention weights)
             # SDPA is faster but can't output attention weights
-            attn_impl = 'eager' if self.segmentation_method == 'CLS' else 'sdpa'
+            attn_impl = self._attn_impl()
             self.model = HubertModel.from_pretrained(
                 "facebook/hubert-base-ls960",
                 attn_implementation=attn_impl
@@ -361,6 +422,8 @@ class Segmenter:
 
             # Map all audio_encoder keys to HuggingFace HuBERT equivalents
             audio_encoder_state = _build_hf_state_dict(state_dict, cls_key)
+            self.image_head = _load_image_head(state_dict)
+            self.cls_layer = getattr(args, 'layer_use', 11)   # layer whose CLS was trained against images
 
             missing_keys, unexpected_keys = self.model.load_state_dict(audio_encoder_state, strict=False)
             logger.info(
@@ -400,7 +463,7 @@ class Segmenter:
                 with open(args_path, "rb") as f:
                     args = pickle.load(f)
                 
-                attn_impl = 'eager' if self.segmentation_method == 'CLS' else 'sdpa'
+                attn_impl = self._attn_impl()
                 self.model = HubertModel.from_pretrained(
                     "facebook/hubert-base-ls960",
                     attn_implementation=attn_impl
@@ -411,6 +474,8 @@ class Segmenter:
                 cls_token = state_dict.get(cls_key, None)
 
                 audio_encoder_state = _build_hf_state_dict(state_dict, cls_key)
+                self.image_head = _load_image_head(state_dict)
+                self.cls_layer = getattr(args, 'layer_use', 11)   # layer whose CLS was trained against images
                 missing_keys, unexpected_keys = self.model.load_state_dict(audio_encoder_state, strict=False)
                 logger.info(
                     f"Loaded {len(audio_encoder_state)} VG-HuBERT weights from Hub "
@@ -433,7 +498,7 @@ class Segmenter:
                     f"https://www.cs.utexas.edu/~harwath/model_checkpoints/vg_hubert/vg-hubert_3.tar"
                 )
                 # Use base HuBERT as fallback for demonstration
-                attn_impl = 'eager' if self.segmentation_method == 'CLS' else 'sdpa'
+                attn_impl = self._attn_impl()
                 self.model = HubertModel.from_pretrained(
                     "facebook/hubert-base-ls960",
                     attn_implementation=attn_impl
@@ -448,7 +513,11 @@ class Segmenter:
         self,
         wav_file: Optional[str] = None,
         wav: Optional[np.ndarray] = None,
-        in_second: bool = True
+        in_second: bool = True,
+        image: bool = False,
+        image_spans: Optional[List[Tuple[float, float]]] = None,
+        restrict: str = "all",
+        k: int = 1,
     ) -> Dict:
         """
         Segment audio (Sylber-compatible interface).
@@ -457,6 +526,9 @@ class Segmenter:
             wav_file: Path to audio file
             wav: Audio waveform array (16kHz, mono)
             in_second: If True, return times in seconds; if False, in frames
+            image: If True, also return image-space vectors (opt-in; default output unchanged)
+            image_spans: (start_s, end_s) spans for 'segment_image' instead of the found segments
+            restrict, k: CLS attention restriction for span vectors, as in embed_spans()
         
         Returns:
             Dictionary containing:
@@ -464,6 +536,10 @@ class Segmenter:
             - 'segment_features': Segment-level features
             - 'hidden_states': Frame-level hidden states
             - 'cls_attention': CLS attention scores (word mode only)
+            With image=True, additionally (None, with a warning, if the checkpoint has no
+            image head):
+            - 'utterance_image': [2048] CLS through the audio-to-image head
+            - 'segment_image': [n_spans, 2048], one per segment (or per image_spans entry)
         """
         # Load audio
         if wav_file is not None:
@@ -516,9 +592,114 @@ class Segmenter:
         
         # Add hidden states
         result['hidden_states'] = features
-        
+
+        # Opt-in image-space outputs; the acoustic keys above are untouched.
+        if image:
+            if self._image_ok():
+                result['utterance_image'] = self._utterance_image(outputs.hidden_states)
+                spans = image_spans if image_spans is not None else (
+                    result['segments'] if in_second else [[l * spf, r * spf] for l, r in result['segments']])
+                result['segment_image'] = self._span_image(audio_tensor, spans, restrict, k)
+            else:
+                result['utterance_image'] = result['segment_image'] = None
+
         return result
     
+    def _load_audio(self, wav_file=None, wav=None) -> torch.Tensor:
+        if wav_file is not None:
+            audio, sr = sf.read(wav_file, dtype='float32')
+        elif wav is not None:
+            audio, sr = np.asarray(wav, dtype=np.float32), 16000
+        else:
+            raise ValueError("Must provide either wav_file or wav")
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        if sr != 16000:
+            import librosa
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+        return torch.from_numpy(audio).float().unsqueeze(0).to(self.device)
+
+    def _image_ok(self) -> bool:
+        if self.image_head is None or not self.has_cls_token:
+            warnings.warn(_NO_IMAGE_HEAD, stacklevel=3)
+            return False
+        return True
+
+    def _utterance_image(self, hidden_states) -> np.ndarray:
+        """CLS at layer `cls_layer` through audio_cls_token_proj, from a forward's hidden_states."""
+        cls = hidden_states[self.cls_layer + 1][:, 0]
+        with torch.no_grad():
+            return self.image_head.to(cls.device)(cls)[0].cpu().numpy()
+
+    def _span_image(self, audio_tensor, spans, restrict="all", k=1) -> np.ndarray:
+        """
+        One image-space vector per (start_s, end_s) span, in a single forward pass: each span gets
+        its own copy of the CLS token whose attention is restricted to the span's frames (plus
+        itself); frames and the original CLS never see these copies. A frame belongs to a span when
+        its centre (20 ms stride, 25 ms receptive field) falls inside it; a span shorter than one
+        frame takes the frame nearest its midpoint.
+        """
+        if len(spans) == 0:
+            return np.zeros((0, self.image_head[-1].out_features), np.float32)
+        m = self.model
+        with torch.no_grad():
+            h = m.feature_projection(m.feature_extractor(audio_tensor).transpose(1, 2))
+            T = h.size(1)
+            centre = (np.arange(T) * 320 + 200) / 16000.0
+            rows = []
+            for s, e in spans:
+                r = (centre >= s) & (centre < e)
+                if not r.any():
+                    r[int(np.argmin(np.abs(centre - (s + e) / 2)))] = True
+                rows.append(r)
+            if restrict == "all":
+                layers = None
+            elif restrict == "last_k":
+                layers = set(range(max(0, self.cls_layer + 1 - k), self.cls_layer + 1))
+            else:
+                raise ValueError(f"restrict must be 'all' or 'last_k', got {restrict}")
+            out = m.encoder(h, output_hidden_states=True, return_dict=True,
+                            span_attend=torch.from_numpy(np.stack(rows)).to(h.device),
+                            span_attend_layers=layers)
+            # hidden_states[layer+1] = output of transformer layer `layer`; extra CLS copies follow the frames
+            cls = out.hidden_states[self.cls_layer + 1][0, T + 1:]
+            return self.image_head.to(cls.device)(cls).cpu().numpy()
+
+    def embed_utterance(self, wav_file: Optional[str] = None, wav: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+        """
+        Image-space embedding of a whole utterance: the CLS token (layer 11) through the
+        audio-to-image projection, as in training (Peng & Harwath). [2048], unnormalised;
+        L2-normalise for cosine. None (with a warning) if the checkpoint has no image head.
+        Same as seg(..., image=True)["utterance_image"].
+        """
+        if not self._image_ok():
+            return None
+        with torch.no_grad():
+            out = self.model(input_values=self._load_audio(wav_file, wav),
+                             output_hidden_states=True, return_dict=True)
+        return self._utterance_image(out.hidden_states)
+
+    def embed_spans(
+        self,
+        spans: List[Tuple[float, float]],
+        wav_file: Optional[str] = None,
+        wav: Optional[np.ndarray] = None,
+        restrict: str = "all",
+        k: int = 1,
+    ) -> Optional[np.ndarray]:
+        """
+        One image-space embedding per (start_s, end_s) span: [n_spans, 2048], unnormalised.
+        The whole utterance is encoded, so every frame keeps its full context; only the span's
+        CLS copy has its attention restricted to the span's frames.
+        restrict: "all" restricts at every layer; "last_k" only at the last k layers up to the
+            CLS layer (earlier layers see the whole utterance).
+        None (with a warning) if the checkpoint has no image head.
+        Same as seg(..., image=True, image_spans=spans)["segment_image"].
+        """
+        if not self._image_ok():
+            return None
+        return self._span_image(self._load_audio(wav_file, wav), spans, restrict, k)
+
     def _segment_featssm(
         self,
         features: np.ndarray,

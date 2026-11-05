@@ -43,6 +43,7 @@ pip install git+https://github.com/human-ai-lab/VG-HuBERT.git
 - 🍎 **Apple Silicon support**: Native MPS acceleration
 - 📦 **PyPI distribution**: Simple `pip install`
 - 🧹 **No fairseq for inference**: Removed complex dependency
+- 🖼️ **Image-space embeddings**: `embed_utterance()` and per-span `embed_spans()` through the trained audio-to-image head
 
 ## Usage
 
@@ -130,11 +131,71 @@ boundaries, ssm = segment_with_mincut(
 
 - **mode**: `"syllable"` (MinCut + feature similarity) or `"word"` (CLS attention)
 - **layer**: HuBERT layer to use (default: 8 for syllables, 9 for words)
-- **device**: `"cuda"`, `"mps"`, or `"cpu"` (defaults to CUDA if available, falls back to MPS on Apple Silicon, then CPU)
+- **device**: `"cuda"`, `"mps"`, or `"cpu"` (defaults to CUDA if available, falls back to MPS on Apple Silicon, then CPU). On MPS the model uses eager attention: torch 2.8's MPS `scaled_dot_product_attention` returns wrong results for non-contiguous inputs of ≤ 8 tokens (audio ≤ ~0.16 s), which SDPA mode would hit on short clips. A test checks MPS against CPU on real speech.
 - **sec_per_syllable**: Target syllable duration for MinCut (default: 0.2)
 - **merge_threshold**: Cosine similarity threshold for merging adjacent segments (default: 0.3, set to `None` to disable)
 - **min_segment_frames**: Filter segments with ≤ this many frames (default: 2)
 - **attn_threshold**: Attention threshold for word boundaries (default: 0.25)
+
+### Image-space embeddings
+
+The syllable checkpoint (`vg-hubert-syllable.pth`, the default `mode="syllable"`) still contains the
+audio-to-image projection it was trained with (`audio_cls_token_proj`, 768 → 1536 → 2048), so the
+segmenter can also place audio in the space shared with images.
+
+```python
+from vg_hubert import Segmenter
+seg = Segmenter()                                    # syllable checkpoint
+
+out = seg("audio.wav", image=True)                   # acoustic keys exactly as before, plus:
+out["utterance_image"]                               # [2048]: CLS (layer 11) -> image space
+out["segment_image"]                                 # [n_segments, 2048]: one per found segment
+
+u = seg.embed_utterance("audio.wav")                 # same as out["utterance_image"]
+spans = [(0.42, 0.61), (0.61, 0.80)]                 # (start_s, end_s)
+X = seg.embed_spans(spans, wav_file="audio.wav")     # [n_spans, 2048]
+X_last = seg.embed_spans(spans, wav_file="audio.wav", restrict="last_k", k=2)
+out = seg("audio.wav", image=True, image_spans=spans)  # segment_image for given spans
+```
+
+`image=False` (the default) returns exactly the same dictionary as before; `image=True` only adds
+`utterance_image` and `segment_image` and leaves every acoustic key identical. The utterance vector
+comes from the same forward pass as the acoustic features; the segment vectors need one more pass.
+
+Span vectors take a single forward pass over the whole utterance, so every frame keeps its full
+context. Each span gets its own copy of the CLS token, appended after the frames, whose attention is
+restricted to the span's frames (plus itself); the frames and the original CLS cannot see these
+copies, so they are computed exactly as without them. Each copy's output at the training layer goes
+through the same projection as `embed_utterance`. A frame
+belongs to a span when its centre (20 ms stride, 25 ms receptive field) falls inside it.
+`restrict="all"` (default) applies the restriction at every layer; `restrict="last_k"` only at the
+last `k` layers, so earlier layers' CLS sees the whole utterance. A span covering the whole
+utterance returns exactly `embed_utterance`. Vectors are unnormalised; L2-normalise for cosine.
+
+Caveat: the model was trained only with utterance-level CLS-to-image matching (no frame- or
+segment-level image loss), so a span vector is a readout of that CLS under restricted attention, not
+an embedding the model was trained to produce.
+
+The word checkpoint (`mode="word"`) is audio-only. Loading it emits a warning that image-space
+vectors are unavailable, and each request for them warns again and returns `None`
+(`embed_utterance`, `embed_spans`, and `utterance_image` / `segment_image` with `image=True`); the
+acoustic output is unaffected.
+
+### What works where
+
+| Functionality | `Segmenter` (this package, `transformers` backend) | Training code (`vg_hubert.model`, fairseq) | `transformers` alone (`HubertModel.from_pretrained`) |
+|---|---|---|---|
+| Frame features, any layer | ✅ | ✅ | ❌ |
+| Syllable segmentation (MinCut) | ✅ | ❌ | ❌ |
+| Word segmentation (CLS attention) | ✅ | ✅ attention weights only | ❌ |
+| Utterance image-space vector | ✅ `seg(..., image=True)`, `embed_utterance` (syllable checkpoint) | ✅ `DualEncoder.forward_audio` | ❌ |
+| Span image-space vectors | ✅ `seg(..., image=True)`, `embed_spans` (syllable checkpoint) | ❌ (`extract_features` does not pass `self_attn_mask`) | ❌ |
+| Image encoder (ViT) | ❌ | ✅ | ❌ |
+
+The Hub repo hosts the original `.pth` checkpoints and `args.pkl`, not a `config.json`/safetensors
+model, so `transformers` cannot load it on its own: the CLS token and the image head need this
+package's loader. Making that possible would mean publishing a converted model with custom modelling
+code (`trust_remote_code`).
 
 See [examples/](examples/) for more usage patterns.
 
@@ -144,10 +205,10 @@ See [examples/](examples/) for more usage patterns.
 
 Two pre-trained models optimized for different tasks:
 
-| Checkpoint | Task | Layer | Algorithm | Size |
-|------------|------|-------|-----------|------|
-| `vg-hubert-syllable.pth` | Syllable | 8 | MinCut + MinCutMerge | 474 MB |
-| `vg-hubert-word.pth` | Word | 9 | CLS Attention | 361 MB |
+| Checkpoint | Task | Layer | Algorithm | Image head | Size |
+|------------|------|-------|-----------|------------|------|
+| `vg-hubert-syllable.pth` | Syllable | 8 | MinCut + MinCutMerge | ✅ (CLS at layer 11) | 474 MB |
+| `vg-hubert-word.pth` | Word | 9 | CLS Attention | ❌ audio only | 361 MB |
 
 ### Algorithm Details
 
@@ -254,10 +315,11 @@ See [configs/](configs/) for complete training examples.
 5. **PyPI distribution**: Easy installation via pip
 6. **Apple Silicon support**: Automatic MPS (Metal Performance Shaders) GPU acceleration
 7. **Optimized MinCut**: **~20-50x faster** syllable segmentation using efficient algorithm from [SyllableLM](https://github.com/AlanBaade/SyllableLM) (Baade et al., 2024) with no quality degradation
+8. **Image-space embeddings**: the syllable checkpoint's audio-to-image head is loaded, exposing `seg(..., image=True)`, `embed_utterance` and `embed_spans`
 
 ## Implementation Details
 
-For inference, this package uses HuggingFace's `transformers.HubertModel` instead of the original fairseq implementation. This is possible because VG-HuBERT's audio encoder architecture is identical to the standard HuBERT model. The visual grounding training adds a vision encoder and cross-modal transformer layers, but these components are only used during training to learn better speech representations. At inference time, only the audio encoder weights are needed, which are fully compatible with the HuggingFace HuBERT architecture. This simplifies deployment and eliminates the fairseq dependency for inference.
+For inference, this package uses HuggingFace's `transformers.HubertModel` instead of the original fairseq implementation. This is possible because VG-HuBERT's audio encoder architecture is identical to the standard HuBERT model. The visual grounding training adds a vision encoder and an audio-to-image projection head. Segmentation needs only the audio encoder weights, which are fully compatible with the HuggingFace HuBERT architecture; the image-space methods additionally load the small projection head (`audio_cls_token_proj`) from the same checkpoint. The vision encoder is not loaded. This simplifies deployment and eliminates the fairseq dependency for inference.
 
 ## Citations
 
