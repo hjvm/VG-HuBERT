@@ -366,6 +366,15 @@ class Segmenter:
         if self.image_head is None:
             warnings.warn(_NO_IMAGE_HEAD, stacklevel=2)
     
+    def _attn_impl(self) -> str:
+        """Eager attention for CLS segmentation (needs attention weights) and on MPS; SDPA otherwise.
+
+        torch 2.8's MPS scaled_dot_product_attention returns wrong results when q/k/v are
+        non-contiguous (as transformers passes them) and the sequence is <= 8 tokens, i.e. audio of
+        <= 7 frames (~0.16 s) plus the CLS token. Eager attention is correct on MPS at every length.
+        """
+        return 'eager' if self.segmentation_method == 'CLS' or self.device == 'mps' else 'sdpa'
+
     def _load_model(self, model_ckpt: str):
         """Load VG-HuBERT model."""
         from transformers import HubertModel
@@ -399,7 +408,7 @@ class Segmenter:
             # Initialize model using transformers HuBERT (avoids fairseq dependency)
             # Use eager attention for CLS segmentation (needs attention weights)
             # SDPA is faster but can't output attention weights
-            attn_impl = 'eager' if self.segmentation_method == 'CLS' else 'sdpa'
+            attn_impl = self._attn_impl()
             self.model = HubertModel.from_pretrained(
                 "facebook/hubert-base-ls960",
                 attn_implementation=attn_impl
@@ -454,7 +463,7 @@ class Segmenter:
                 with open(args_path, "rb") as f:
                     args = pickle.load(f)
                 
-                attn_impl = 'eager' if self.segmentation_method == 'CLS' else 'sdpa'
+                attn_impl = self._attn_impl()
                 self.model = HubertModel.from_pretrained(
                     "facebook/hubert-base-ls960",
                     attn_implementation=attn_impl
@@ -489,7 +498,7 @@ class Segmenter:
                     f"https://www.cs.utexas.edu/~harwath/model_checkpoints/vg_hubert/vg-hubert_3.tar"
                 )
                 # Use base HuBERT as fallback for demonstration
-                attn_impl = 'eager' if self.segmentation_method == 'CLS' else 'sdpa'
+                attn_impl = self._attn_impl()
                 self.model = HubertModel.from_pretrained(
                     "facebook/hubert-base-ls960",
                     attn_implementation=attn_impl

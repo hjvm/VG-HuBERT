@@ -131,7 +131,7 @@ boundaries, ssm = segment_with_mincut(
 
 - **mode**: `"syllable"` (MinCut + feature similarity) or `"word"` (CLS attention)
 - **layer**: HuBERT layer to use (default: 8 for syllables, 9 for words)
-- **device**: `"cuda"`, `"mps"`, or `"cpu"` (defaults to CUDA if available, falls back to MPS on Apple Silicon, then CPU)
+- **device**: `"cuda"`, `"mps"`, or `"cpu"` (defaults to CUDA if available, falls back to MPS on Apple Silicon, then CPU). On MPS the model uses eager attention: torch 2.8's MPS `scaled_dot_product_attention` returns wrong results for non-contiguous inputs of ≤ 8 tokens (audio ≤ ~0.16 s), which SDPA mode would hit on short clips. A test checks MPS against CPU on real speech.
 - **sec_per_syllable**: Target syllable duration for MinCut (default: 0.2)
 - **merge_threshold**: Cosine similarity threshold for merging adjacent segments (default: 0.3, set to `None` to disable)
 - **min_segment_frames**: Filter segments with ≤ this many frames (default: 2)

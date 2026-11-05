@@ -730,3 +730,56 @@ def test_word_checkpoint_warns_and_returns_none(word_ckpt_path, libri_wav):
         out = seg(wav=libri_wav, image=True)
     assert out["utterance_image"] is None and out["segment_image"] is None
     assert len(out["segments"]) > 0 and out["hidden_states"].ndim == 2
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: MPS == CPU (Apple Silicon only), on real LibriSpeech
+#
+# torch 2.8's MPS scaled_dot_product_attention is wrong for non-contiguous q/k/v on sequences of
+# <= 8 tokens; the segmenter therefore uses eager attention on MPS. Short inputs are exactly the
+# segmenter's own found segments cropped alone, so those are checked as well as whole utterances.
+# ---------------------------------------------------------------------------
+
+_SKIP_MPS = pytest.mark.skipif(not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()),
+                               reason="MPS not available")
+
+
+@pytest.fixture(scope="module")
+def mps_seg(syllable_ckpt_path):
+    from vg_hubert import Segmenter
+    return Segmenter(model_ckpt=str(syllable_ckpt_path.parent), device="mps")
+
+
+def _rel(a, b):
+    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    return float(np.abs(a - b).max() / (np.abs(a).max() + 1e-12))
+
+
+@_SKIP_MPS
+@_SKIP_CKPT
+def test_mps_matches_cpu(syl_seg, mps_seg, libri_wav):
+    cpu_out, mps_out = syl_seg(wav=libri_wav, image=True), mps_seg(wav=libri_wav, image=True)
+    assert [list(map(float, s)) for s in cpu_out["segments"]] == [list(map(float, s)) for s in mps_out["segments"]]
+    assert _rel(cpu_out["hidden_states"], mps_out["hidden_states"]) < 1e-3
+    assert _rel(cpu_out["utterance_image"], mps_out["utterance_image"]) < 1e-3
+    assert _rel(cpu_out["segment_image"], mps_out["segment_image"]) < 1e-3
+
+    found = [tuple(map(float, s)) for s in cpu_out["segments"]]
+    for kw in (dict(), dict(restrict="last_k", k=1)):
+        assert _rel(syl_seg.embed_spans(found, wav=libri_wav, **kw),
+                    mps_seg.embed_spans(found, wav=libri_wav, **kw)) < 1e-3
+
+    with torch.no_grad():
+        hc = syl_seg.model(input_values=torch.from_numpy(libri_wav)[None], output_hidden_states=True).hidden_states
+        hm = mps_seg.model(input_values=torch.from_numpy(libri_wav)[None].to("mps"), output_hidden_states=True).hidden_states
+    for L, (a, b) in enumerate(zip(hc, hm)):
+        assert _rel(a.numpy(), b.cpu().numpy()) < 1e-3, f"hidden_states[{L}]"
+
+    short = 0
+    for s, e in found:                                   # each found segment cropped alone
+        w = libri_wav[int(s * 16000):int(e * 16000)]
+        a, b = syl_seg(wav=w, image=True), mps_seg(wav=w, image=True)
+        short += a["hidden_states"].shape[0] <= 7
+        assert _rel(a["hidden_states"], b["hidden_states"]) < 1e-3, f"crop {e - s:.3f}s"
+        assert _rel(a["utterance_image"], b["utterance_image"]) < 1e-3, f"crop {e - s:.3f}s"
+    print(f"{len(found)} crops, {short} of <= 7 frames")
